@@ -1,0 +1,19 @@
+**/.venv
+**/__pycache__ 
+**/.env
+
+# venv
+de-open-source
+
+# Ignore all files inside
+data/**
+airflow/logs/**
+docker/minio/**
+
+# Keep the folder itself 
+!data/
+!airflow/logs/
+
+# Keep .gitkeep files so empty folder structure is preserved
+!data/**/.gitkeep
+!airflow/logs/**/.gitkeep
