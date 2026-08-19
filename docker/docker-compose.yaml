@@ -1,0 +1,242 @@
+name: lakehouse-batch
+
+services:
+  # ==================================================
+  # Hive metastore service consists of PostgreSQL (metadata) and Hive metastore
+  # ========================= =========================
+  # Use PostgreSQL to store Hive metadata about
+  # how the datafile are mapped to schemas and tables
+  metastore_db:
+    image: postgres:11
+    hostname: metastore_db
+    ports:
+      - "${META_DB_PORT_EXPOSE}:5432" # Access via Thrift protocol
+    environment:
+      POSTGRES_USER: ${META_DB_USER:-hive}
+      POSTGRES_PASSWORD: ${META_DB_PASSWORD:-hive}
+      POSTGRES_DB: ${META_DB_NAME:-metastore}
+      # custom env vars
+      META_DB_PORT_EXPOSE: ${META_DB_PORT_EXPOSE:-5433}
+    volumes:
+      - metastore-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+      interval: 1s
+      timeout: 10s
+      retries: 10
+    networks:
+      - lakehouse-network
+
+  # Expose service to get metadata, which is a repository of metadata about the tables,
+  # such as database names, table names, schema and data location of each table
+  hive-metastore:
+    image: "starburstdata/hive:3.1.2-e.18"
+    hostname: hive-metastore
+    environment:
+      HIVE_METASTORE_DRIVER: ${META_DB_DRIVER:-org.postgresql.Driver}
+      HIVE_METASTORE_JDBC_URL: ${META_DB_URL:-jdbc:postgresql://metastore_db:5432/metastore}
+      HIVE_METASTORE_USER: ${METASTORE_DB_USER:-hive}
+      HIVE_METASTORE_PASSWORD: ${METASTORE_DB_PASSWORD:-hive}
+      HIVE_METASTORE_WAREHOUSE_DIR: ${WAREHOUSE_DIR:-s3://iceberg}
+      HIVE_METASTORE_USERS_IN_ADMIN_ROLE: "admin"
+      S3_ENDPOINT: ${MINIO_INTERNAL_ENDPOINT:-http://minio:9000}
+      S3_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minio_access_key}
+      S3_SECRET_KEY: ${MINIO_SECRET_KEY:-minio_secret_key}
+      S3_PATH_STYLE_ACCESS: "true"
+      REGION: ""
+      GOOGLE_CLOUD_KEY_FILE_PATH: ""
+      AZURE_ADL_CLIENT_ID: ""
+      AZURE_ADL_CREDENTIAL: ""
+      AZURE_ADL_REFRESH_URL: ""
+      AZURE_ABFS_STORAGE_ACCOUNT: ""
+      AZURE_ABFS_ACCESS_KEY: ""
+      AZURE_WASB_STORAGE_ACCOUNT: ""
+      AZURE_ABFS_OAUTH: ""
+      AZURE_ABFS_OAUTH_TOKEN_PROVIDER: ""
+      AZURE_ABFS_OAUTH_CLIENT_ID: ""
+      AZURE_ABFS_OAUTH_SECRET: ""
+      AZURE_ABFS_OAUTH_ENDPOINT: ""
+      AZURE_WASB_ACCESS_KEY: ""
+      # custom env vars
+      HIVE_METASTORE_PORT_EXPOSE: ${HIVE_METASTORE_PORT_EXPOSE:-9083}
+    ports:
+      - "${HIVE_METASTORE_PORT_EXPOSE}:9083" # Access via Thrift protocol
+    depends_on:
+      - metastore_db
+      - minio
+    networks:
+      - lakehouse-network
+
+  # ==================================================
+  # MinIO service: S3 compatible object storage
+  # ==================================================
+  minio:
+    image: minio/minio
+    hostname: minio
+    ports:
+      - ${MINIO_API_PORT:-9000}:9000
+      - ${MINIO_CONSOLE_PORT:-9001}:9001
+    volumes:
+      - ./minio:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minio_access_key}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minio_secret_key}
+    command: server /data --console-address ":${MINIO_CONSOLE_PORT:-9001}"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:${MINIO_API_PORT:-9000}/minio/health/live",
+        ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - lakehouse-network
+
+  # Create bucket in MinIO: create iceberg bucket
+  createbucket:
+    hostname: createbucket
+    image: minio/mc # MinIO Client tool
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minio_access_key}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minio_secret_key}
+
+      MINIO_ENDPOINT: ${MINIO_INTERNAL_ENDPOINT:-http://minio:9000}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-iceberg}
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set myminio ${MINIO_ENDPOINT} ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY}; do
+        echo 'Waiting for MinIO to be ready...';
+        sleep 2;
+      done;
+      /usr/bin/mc mb --ignore-existing myminio/iceberg;
+      /usr/bin/mc mb --ignore-existing myminio/landing;
+      /usr/bin/mc mb --ignore-existing myminio/staging;
+      echo 'Buckets created successfully';
+      "
+    networks:
+      - lakehouse-network
+
+  # ==================================================
+  # Spark cluster service consists of Spark master and worker (standalone mode)
+  # use `docker-compose --profile spark up` to start the Spark cluster.
+  # ==================================================
+  spark-master:
+    build:
+      context: ./spark/spark-config
+      dockerfile: Dockerfile
+    image: lakehouse-spark:3.5.0
+    hostname: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    user: root
+    profiles:
+      - spark
+    environment:
+      # These are env vars injected into the container
+      SPARK_MASTER_PORT_EXPOSE: ${SPARK_MASTER_PORT_EXPOSE:-7077}
+      SPARK_MASTER_WEBUI_PORT_EXPOSE: ${SPARK_MASTER_WEBUI_PORT_EXPOSE:-8081}
+    volumes:
+      - ./spark/spark-apps:/opt/spark-apps
+      - ../scripts/batch:/opt/spark-batch:ro
+      - ./spark/spark-config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./spark/spark-config/hive-site.xml:/opt/spark/conf/hive-site.xml
+      - ./spark/spark-config/core-site.xml:/opt/spark/conf/core-site.xml
+    ports: # expost to host
+      - "${SPARK_MASTER_WEBUI_PORT_EXPOSE}:8080"
+      - "${SPARK_MASTER_PORT_EXPOSE}:7077"
+    depends_on:
+      - minio
+    restart: on-failure:3
+    networks:
+      - lakehouse-network
+
+  spark-worker:
+    build:
+      context: ./spark/spark-config
+      dockerfile: Dockerfile
+    image: lakehouse-spark:3.5.0
+    hostname: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker ${SPARK_MASTER_URL} --cores ${SPARK_WORKER_CORES:-1} --memory ${SPARK_WORKER_MEMORY:-2g}
+    # ADD user: root to ensure it has permissions to write packages to the cache volume
+    user: root
+    profiles:
+      - spark
+    depends_on:
+      - spark-master
+    restart: on-failure:3
+    environment:
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-1}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
+      # custom env vars
+      SPARK_WORKER_IP_RANGE: ${SPARK_WORKER_IP_RANGE:-'8091-8100'}
+    volumes:
+      - ../scripts/batch:/opt/spark-batch:ro
+      - ./spark/spark-config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./spark/spark-config/hive-site.xml:/opt/spark/conf/hive-site.xml
+      - ./spark/spark-config/core-site.xml:/opt/spark/conf/core-site.xml
+    ports:
+      - ${SPARK_WORKER_IP_RANGE}:8081
+    networks:
+      - lakehouse-network
+
+    # ==================================================
+  # Spark Thrift Server service is required for SQL queries via JDBC/ODBC
+  # ==================================================
+  spark-thriftserver:
+    hostname: spark-thriftserver
+    build:
+      context: ./spark/spark-config
+      dockerfile: Dockerfile
+    image: lakehouse-spark:3.5.0
+    user: root
+    profiles:
+      - spark
+    command: >
+      /bin/bash -c "
+      echo 'Starting Spark Thrift Server with Iceberg support...' &&
+      /opt/spark/sbin/start-thriftserver.sh 
+      --master spark://spark-master:7077
+      --hiveconf hive.metastore.uris=thrift://hive-metastore:9083
+      --hiveconf hive.metastore.warehouse.dir=s3a://iceberg &&
+      echo 'Thrift Server started successfully' &&
+      tail -f /opt/spark/logs/*
+      "
+    depends_on:
+      - spark-master
+      - hive-metastore
+    environment:
+      # custom env vars
+      SPARK_THRIFT_PORT_EXPOSE: ${SPARK_THRIFT_PORT_EXPOSE:-10000}
+      SPARK_THRIFT_UI_PORT_EXPOSE: ${SPARK_THRIFT_UI_PORT_EXPOSE:-4040}
+    volumes:
+      - ./spark/spark-apps:/opt/spark-apps
+      - ../scripts/batch:/opt/spark-batch:ro
+      - ./spark/spark-config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./spark/spark-config/hive-site.xml:/opt/spark/conf/hive-site.xml
+      - ./spark/spark-config/core-site.xml:/opt/spark/conf/core-site.xml
+
+    ports:
+      - "${SPARK_THRIFT_PORT_EXPOSE}:10000" # Thrift Server JDBC port
+      - "${SPARK_THRIFT_UI_PORT_EXPOSE}:4040" # Spark UI
+    networks:
+      - lakehouse-network
+
+volumes:
+  metastore-data:
+
+# ==================================================
+# Networks configuration
+# lakehouse-network: external network for data platform services. This network must be created before running the docker-compose file.
+# use `docker network create --driver bridge lakehouse-network` to create the network.
+# ==================================================
+networks:
+  lakehouse-network:
+    external: true
