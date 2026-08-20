@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  
+jobs:
+  python-checks:
+    name: Python checks
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v6
+      
+      - name: Install Python
+        uses: actions/setup-python@v6 
+        with:
+          python-version: "3.11"
+
+      - name: Check Python syntax
+        run: python -m compileall -q airflow/dags airflow/plugins
+        # -q: reduces unnecessary output
+
+  compose-checks:
+    name: Docker Compose checks
+    runs-on: ubuntu-22.04
+
+    env:
+      MINIO_ENDPOINT: http://minio:9000
+      SPARK_THRIFT_UI_PORT_EXPOSE: "4040"
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v6
+      
+      - name: Validate lakehouse configuration
+        # config --quite: validates the configuration without starting any containers
+        run: >-
+          docker compose
+          --env-file docker/.env.example
+          -f docker/docker-compose.yaml
+          --profile spark
+          config --quiet
+      
+      - name: Validate Airflow configuration
+        run: >-
+          docker compose
+          --env-file docker/.env.example
+          --env-file airflow/.env.example
+          -f airflow/docker-compose.yaml
+          config --quiet
